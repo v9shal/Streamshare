@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>StreamShare Live View</title>
+    <!-- Import xterm.js from a CDN -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js"></script>
+    <style>
+        body { margin: 0; padding: 20px; background-color: #0f111a; color: white; font-family: sans-serif; }
+        h2 { margin-top: 0; color: #00ffcc; }
+        #terminal-container { width: 100%; height: 80vh; padding: 10px; background: black; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h2>StreamShare.dev - Live Output</h2>
+    <div id="terminal-container"></div>
+
+    <script>
+        // 1. Initialize the xterm.js terminal UI
+        const term = new Terminal({
+            theme: { background: '#000000' },
+            convertEol: true // Automatically handle line breaks
+        });
+        term.open(document.getElementById('terminal-container'));
+        term.writeln('Waiting for CLI to stream data...\r\n');
+
+        // 2. Connect back to our Go WebSocket Server!
+        // We will hit a new endpoint called /subscribe
+        const ws = new WebSocket("ws://" + window.location.host + "/subscribe");
+
+        ws.onopen = () => {
+            term.writeln('\x1b[32m[Connected to Server!]\x1b[0m\r\n');
+        };
+
+        ws.onmessage = async (event) => {
+            // WebSockets can send strings or blobs (binary). We handle both.
+            if (event.data instanceof Blob) {
+                const text = await event.data.text();
+                term.write(text);
+            } else {
+                term.write(event.data);
+            }
+        };
+
+        ws.onclose = () => {
+            term.writeln('\r\n\x1b[31m[Stream Ended / Server Disconnected]\x1b[0m');
+        };
+    </script>
+</body>
+</html>
