@@ -5,14 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http" // Add this!
+	"net/http"
 	"os"
 
 	"github.com/gorilla/websocket"
 )
 
 func main() {
-	// 1. Check if it's a keyboard (Your existing code)
 	fi, err := os.Stdin.Stat()
 	if err != nil {
 		fmt.Println(err)
@@ -21,17 +20,12 @@ func main() {
 		fmt.Println("Error: Please pipe data into this command. Example: echo 'hello' | streamshare")
 		os.Exit(1)
 	}
-
-	// ==========================================
-	// 2. NEW: Get a Room from the Server!
-	// ==========================================
-	// a. Use http.Get("http://localhost:8080/create")
-	// b. Check for error (if err != nil)
-	// c. Don't forget to defer closing the body! (defer resp.Body.Close())
-	// d. Read the body using io.ReadAll(resp.Body)
-	// e. Print the body out to the user nicely so they know their link!
-
-	resp, err := http.Get("http://localhost:8080/create")
+	host := os.Getenv("STREAMSHARE_HOST")
+	if host == "" {
+		host = "localhost:8080"
+	}
+	httpURL := fmt.Sprintf("http://%s/create", host)
+	resp, err := http.Get(httpURL)
 	if err != nil {
 		fmt.Println("error wile fetching the room code", err)
 		os.Exit(1)
@@ -43,8 +37,11 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println(string(link))
+	roomID := string(link)
 
-	wsURL := "ws://localhost:8080/stream"
+	fmt.Printf("\nLive Link: http://localhost:8080/?room=%s\n", roomID)
+	fmt.Println("--- STREAMING LOGS TO THE WEB ---")
+	wsURL := fmt.Sprintf("ws://%s/stream?room=%s", host, roomID)
 	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		fmt.Println("Error connecting to server stream:", err)
@@ -65,10 +62,6 @@ func main() {
 			break
 		}
 
-		// ==========================================
-		// 4. NEW: SEND IT OVER THE WEBSOCKET!
-		// (Notice we replaced fmt.Print with this!)
-		// ==========================================
 		err = wsConn.WriteMessage(websocket.TextMessage, buf[:n])
 		if err != nil {
 			fmt.Println("\nServer disconnected.")

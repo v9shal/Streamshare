@@ -27,7 +27,17 @@
 
         // 2. Connect back to our Go WebSocket Server!
         // We will hit a new endpoint called /subscribe
-        const ws = new WebSocket("ws://" + window.location.host + "/subscribe");
+       // Grab the ?room=abc-123 part from the browser's address bar
+const urlParams = new URLSearchParams(window.location.search);
+const roomID = urlParams.get('room');
+
+if (!roomID) {
+    term.writeln('\x1b[31m[Error] No room ID found in URL!\x1b[0m');
+} else {
+    // Append it to the WebSocket connection!
+    const ws = new WebSocket("ws://" + window.location.host + "/subscribe?room=" + roomID);
+    
+    // ... keep your ws.onopen, ws.onmessage, ws.onclose exactly the same ...
 
         ws.onopen = () => {
             term.writeln('\x1b[32m[Connected to Server!]\x1b[0m\r\n');
@@ -46,6 +56,7 @@
         ws.onclose = () => {
             term.writeln('\r\n\x1b[31m[Stream Ended / Server Disconnected]\x1b[0m');
         };
+        }
     </script>
 </body>
 </html>
