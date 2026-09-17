@@ -39,7 +39,7 @@ func main() {
 	fmt.Println(string(link))
 	roomID := string(link)
 
-	fmt.Printf("\nLive Link: http://localhost:8080/?room=%s\n", roomID)
+	fmt.Printf("\n Live Link: http://%s/?room=%s\n", host, roomID)
 	fmt.Println("--- STREAMING LOGS TO THE WEB ---")
 	wsURL := fmt.Sprintf("ws://%s/stream?room=%s", host, roomID)
 	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)

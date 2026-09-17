@@ -91,7 +91,6 @@ func handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		fmt.Errorf("%w", err)
 		return
 	}
-	// 1. First, instantly send the viewer all the PAST logs from the Ferris Wheel!
 	pastLogs := myRoom.buffer.GetAll()
 	myRoom.clientsMu.Lock()
 	myRoom.client[conn] = true
@@ -100,8 +99,6 @@ func handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		conn.WriteMessage(websocket.TextMessage, line)
 	}
 
-	// 2. Keep the connection open forever so we can send future logs.
-	// (For now, we just loop forever to keep it alive. We will do real Pub/Sub in Milestone 6)
 	for {
 		_, _, err := conn.ReadMessage()
 		if err != nil {
@@ -117,7 +114,6 @@ func startHttpServer(wg *sync.WaitGroup) *http.Server {
 	}
 	srv := &http.Server{Addr: ":" + port}
 
-	// Existing endpoints
 	http.HandleFunc("/create", func(w http.ResponseWriter, r *http.Request) {
 		RoomMu.Lock()
 
@@ -130,14 +126,11 @@ func startHttpServer(wg *sync.WaitGroup) *http.Server {
 	})
 	http.HandleFunc("/stream", handleStream)
 
-	// NEW ENDPOINTS:
 	http.HandleFunc("/subscribe", handleSubscribe)
 
-	// Serve our HTML file!
 	fs := http.FileServer(http.Dir("./static"))
 	http.Handle("/", fs)
 
-	// ... Keep your WaitGroup / ListenAndServe code here exactly as it is!
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
