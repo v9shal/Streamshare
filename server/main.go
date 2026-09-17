@@ -1,158 +1,351 @@
 package main
 
 import (
-	"fmt"
+	"context"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
-	"uuid"
+	"syscall"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+)
+
+const (
+	bufferSize      = 1000
+	roomIdleTTL     = 30 * time.Minute
+	roomAfterEndTTL = 2 * time.Minute
+	pingInterval    = 30 * time.Second
+	pongWait        = 60 * time.Second
+	writeWait       = 10 * time.Second
+	maxMessageSize  = 1 << 20
 )
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-type Room struct {
-	buffer    *RingBuffer
-	client    map[*websocket.Conn]bool
-	clientsMu sync.Mutex
+type client struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
 }
 
-func NewRoom(clientMap map[*websocket.Conn]bool) *Room {
+func (c *client) writeMessage(messageType int, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	return c.conn.WriteMessage(messageType, data)
+}
+
+func (c *client) writeControl(messageType int, data []byte, deadline time.Time) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.conn.WriteControl(messageType, data, deadline)
+}
+
+type Room struct {
+	id      string
+	buffer  *RingBuffer
+	created time.Time
+
+	mu           sync.Mutex
+	viewers      map[*client]bool
+	streamerLive bool
+	lastActivity time.Time
+}
+
+func NewRoom(id string) *Room {
+	now := time.Now()
 	return &Room{
-		buffer: NewRingBuffer(1000),
-		client: clientMap,
+		id:           id,
+		buffer:       NewRingBuffer(bufferSize),
+		created:      now,
+		viewers:      make(map[*client]bool),
+		lastActivity: now,
 	}
 }
 
-var globalRoom = make(map[string]*Room)
-var RoomMu sync.Mutex
+func (r *Room) addViewer(c *client) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.viewers[c] = true
+}
 
-func handleStream(w http.ResponseWriter, r *http.Request) {
+func (r *Room) removeViewer(c *client) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.viewers, c)
+}
+
+func (r *Room) broadcast(messageType int, data []byte) {
+	r.mu.Lock()
+	viewers := make([]*client, 0, len(r.viewers))
+	for v := range r.viewers {
+		viewers = append(viewers, v)
+	}
+	r.mu.Unlock()
+
+	for _, v := range viewers {
+		if err := v.writeMessage(messageType, data); err != nil {
+			r.removeViewer(v)
+			v.conn.Close()
+		}
+	}
+}
+
+func (r *Room) touch() {
+	r.mu.Lock()
+	r.lastActivity = time.Now()
+	r.mu.Unlock()
+}
+
+func (r *Room) setStreamerLive(live bool) {
+	r.mu.Lock()
+	r.streamerLive = live
+	r.lastActivity = time.Now()
+	r.mu.Unlock()
+}
+
+func (r *Room) idleFor() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return time.Since(r.lastActivity)
+}
+
+func (r *Room) isStreamerLive() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.streamerLive
+}
+
+type RoomManager struct {
+	mu    sync.RWMutex
+	rooms map[string]*Room
+}
+
+func NewRoomManager() *RoomManager {
+	return &RoomManager{rooms: make(map[string]*Room)}
+}
+
+func (m *RoomManager) Create() *Room {
+	room := NewRoom(uuid.New().String())
+	m.mu.Lock()
+	m.rooms[room.id] = room
+	m.mu.Unlock()
+	return room
+}
+
+func (m *RoomManager) Get(id string) (*Room, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	room, ok := m.rooms[id]
+	return room, ok
+}
+
+func (m *RoomManager) delete(id string) {
+	m.mu.Lock()
+	delete(m.rooms, id)
+	m.mu.Unlock()
+}
+func (m *RoomManager) janitor(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.mu.RLock()
+			var stale []string
+			for id, room := range m.rooms {
+				idle := room.idleFor()
+				if room.isStreamerLive() {
+					if idle > roomIdleTTL {
+						stale = append(stale, id)
+					}
+					continue
+				}
+				if idle > roomAfterEndTTL {
+					stale = append(stale, id)
+				}
+			}
+			m.mu.RUnlock()
+
+			for _, id := range stale {
+				if room, ok := m.Get(id); ok {
+					room.mu.Lock()
+					for v := range room.viewers {
+						v.conn.Close()
+					}
+					room.mu.Unlock()
+				}
+				m.delete(id)
+				log.Printf("janitor: reclaimed idle room %s", id)
+			}
+		}
+	}
+}
+
+type server struct {
+	rooms *RoomManager
+}
+
+func (s *server) handleCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	room := s.rooms.Create()
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(room.id))
+}
+
+func (s *server) handleStream(w http.ResponseWriter, r *http.Request) {
+	roomID := r.URL.Query().Get("room")
+	room, exists := s.rooms.Get(roomID)
+	if !exists {
+		http.Error(w, "room not found", http.StatusNotFound)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
-
 	if err != nil {
-		fmt.Println("Upgrade failed:", err)
+		log.Println("stream upgrade failed:", err)
 		return
 	}
 	defer conn.Close()
 
-	fmt.Println("CLI Connected via WebSocket!")
+	room.setStreamerLive(true)
+	defer room.setStreamerLive(false)
 
-	roomID := r.URL.Query().Get("room")
-	RoomMu.Lock()
-	myRoom, exists := globalRoom[roomID]
-	RoomMu.Unlock()
-	if !exists {
-		fmt.Errorf("%w", err)
-		return
-	}
+	log.Printf("room %s: streamer connected", roomID)
+	defer log.Printf("room %s: streamer disconnected", roomID)
 
+	conn.SetReadLimit(maxMessageSize)
 	for {
 		msgType, msg, err := conn.ReadMessage()
 		if err != nil {
-			fmt.Println("CLI Disconnected!")
-			break
+			return
 		}
-
-		if msgType == websocket.TextMessage || msgType == websocket.BinaryMessage {
-			myRoom.buffer.Write(msg)
-			myRoom.clientsMu.Lock()
-			for viewerConn := range myRoom.client {
-				viewerConn.WriteMessage(websocket.TextMessage, msg)
-			}
-			myRoom.clientsMu.Unlock()
-			fmt.Print("SERVER RECEIVED: " + string(msg))
+		if msgType != websocket.TextMessage && msgType != websocket.BinaryMessage {
+			continue
 		}
+		room.touch()
+		room.buffer.Write(msg)
+		room.broadcast(websocket.TextMessage, msg)
 	}
 }
-func handleSubscribe(w http.ResponseWriter, r *http.Request) {
+
+func (s *server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
+	roomID := r.URL.Query().Get("room")
+	room, exists := s.rooms.Get(roomID)
+	if !exists {
+		http.Error(w, "room not found", http.StatusNotFound)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		fmt.Println("Browser upgrade failed:", err)
+		log.Println("subscribe upgrade failed:", err)
 		return
 	}
 	defer conn.Close()
-	fmt.Println("Web Browser Viewer Connected!")
 
-	roomID := r.URL.Query().Get("room")
-	RoomMu.Lock()
-	myRoom, exists := globalRoom[roomID]
-	defer func() {
-		myRoom.clientsMu.Lock()
-		delete(myRoom.client, conn)
-		myRoom.clientsMu.Unlock()
+	c := &client{conn: conn}
+	room.addViewer(c)
+	defer room.removeViewer(c)
+	history := room.buffer.GetAll()
+
+	log.Printf("room %s: viewer connected", roomID)
+	defer log.Printf("room %s: viewer disconnected", roomID)
+
+	for _, line := range history {
+		if err := c.writeMessage(websocket.TextMessage, line); err != nil {
+			return
+		}
+	}
+
+	runKeepalive(c)
+}
+
+func runKeepalive(c *client) {
+	c.conn.SetReadLimit(maxMessageSize)
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, _, err := c.conn.ReadMessage(); err != nil {
+				return
+			}
+		}
 	}()
-	RoomMu.Unlock()
-	if !exists {
-		fmt.Errorf("%w", err)
-		return
-	}
-	// 1. First, instantly send the viewer all the PAST logs from the Ferris Wheel!
-	pastLogs := myRoom.buffer.GetAll()
-	myRoom.clientsMu.Lock()
-	myRoom.client[conn] = true
-	myRoom.clientsMu.Unlock()
-	for _, line := range pastLogs {
-		conn.WriteMessage(websocket.TextMessage, line)
-	}
 
-	// 2. Keep the connection open forever so we can send future logs.
-	// (For now, we just loop forever to keep it alive. We will do real Pub/Sub in Milestone 6)
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
 	for {
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			fmt.Println("Web Browser Viewer Disconnected!")
-			break
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := c.writeControl(websocket.PingMessage, nil, time.Now().Add(writeWait)); err != nil {
+				return
+			}
 		}
 	}
 }
-func startHttpServer(wg *sync.WaitGroup) *http.Server {
+
+func (s *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
+}
+
+func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	srv := &http.Server{Addr: ":" + port}
 
-	// Existing endpoints
-	http.HandleFunc("/create", func(w http.ResponseWriter, r *http.Request) {
-		RoomMu.Lock()
+	s := &server{rooms: NewRoomManager()}
 
-		roomID := uuid.New().String()
-		RoomMap := make(map[*websocket.Conn]bool)
-		Room := NewRoom(RoomMap)
-		fmt.Fprintf(w, "%s", roomID)
-		globalRoom[roomID] = Room
-		RoomMu.Unlock()
-	})
-	http.HandleFunc("/stream", handleStream)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/create", s.handleCreate)
+	mux.HandleFunc("/stream", s.handleStream)
+	mux.HandleFunc("/subscribe", s.handleSubscribe)
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.Handle("/", http.FileServer(http.Dir("./static")))
 
-	// NEW ENDPOINTS:
-	http.HandleFunc("/subscribe", handleSubscribe)
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
 
-	// Serve our HTML file!
-	fs := http.FileServer(http.Dir("./static"))
-	http.Handle("/", fs)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// ... Keep your WaitGroup / ListenAndServe code here exactly as it is!
-	wg.Add(1)
+	go s.rooms.janitor(ctx)
+
 	go func() {
-		defer wg.Done()
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			log.Fatalf("ListenAndServe(): %v", err)
+		log.Printf("streamshare-server listening on :%s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("ListenAndServe: %v", err)
 		}
 	}()
-	return srv
-}
-func main() {
-	log.Printf("main: starting HTTP server")
 
-	httpServerExitDone := &sync.WaitGroup{}
+	<-ctx.Done()
+	log.Println("shutting down...")
 
-	startHttpServer(httpServerExitDone)
-	httpServerExitDone.Wait()
-
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful shutdown failed: %v", err)
+	}
 }
