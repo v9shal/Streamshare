@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http" // Add this!
 	"os"
+
+	"github.com/gorilla/websocket"
 )
 
 func main() {
@@ -42,9 +44,15 @@ func main() {
 	}
 	fmt.Println(string(link))
 
-	// ==========================================
-	// 3. Scoop up the Logs (Your existing code)
-	// ==========================================
+	wsURL := "ws://localhost:8080/stream"
+	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		fmt.Println("Error connecting to server stream:", err)
+		os.Exit(1)
+	}
+	defer wsConn.Close() // Hang up when the program exits
+
+	// 3. The Pipe Loop
 	reader := bufio.NewReader(os.Stdin)
 	buf := make([]byte, 4096)
 	for {
@@ -56,6 +64,15 @@ func main() {
 			fmt.Println("Error reading:", err)
 			break
 		}
-		fmt.Print(string(buf[:n]))
+
+		// ==========================================
+		// 4. NEW: SEND IT OVER THE WEBSOCKET!
+		// (Notice we replaced fmt.Print with this!)
+		// ==========================================
+		err = wsConn.WriteMessage(websocket.TextMessage, buf[:n])
+		if err != nil {
+			fmt.Println("\nServer disconnected.")
+			break
+		}
 	}
 }
