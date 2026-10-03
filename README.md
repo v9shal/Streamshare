@@ -1,5 +1,7 @@
 # StreamShare
 
+[![CI](https://github.com/v9shal/Streamshare/actions/workflows/ci.yml/badge.svg?branch=feat%2Fcli-server)](https://github.com/v9shal/Streamshare/actions/workflows/ci.yml)
+
 StreamShare lets you pipe the output of any command into a live, shareable
 web link. Anyone with the link can watch the output stream in their browser
 in real time, and late joiners see recent history first.
@@ -9,6 +11,16 @@ some-long-command | streamshare
 ```
 
 ## How it works
+
+```mermaid
+flowchart LR
+  CLI[CLI reads stdin] -->|GET /create| API[HTTP server creates room]
+  API -->|room ID| CLI
+  CLI -->|WebSocket stream| Room[Room ring buffer]
+  Room -->|live chunks| Viewers[WebSocket viewers]
+  Viewers -->|subscribe and register| Room
+  Room -->|buffered history, then live chunks| Viewers
+```
 
 ```
  ┌────────────┐   1. GET /create    ┌─────────────────┐
